@@ -30,6 +30,7 @@ import argparse
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
+import sys
 
 TICKER_MAP = {
     "BRK B": "BRK.B",
@@ -154,6 +155,72 @@ def group_corporate_actions(raw_actions: list[dict]) -> list[dict]:
     return adjustments
 
 
+# ── eTrade PDF parsing ────────────────────────────────────────────────────────
+
+def _parse_etrade_pdf(pdf_path: Path) -> "dict | None":
+    try:
+        import pdfplumber
+    except ImportError:
+        raise SystemExit("pdfplumber is required for eTrade PDF parsing. Run: pip3 install pdfplumber")
+
+    with pdfplumber.open(pdf_path) as pdf:
+        text = pdf.pages[0].extract_text()
+
+    if not text:
+        return None
+
+    # Data row: "MM/DD/YYYY  MM/DD/YYYY  QTY  PRICE  ..."
+    m = re.search(
+        r'(\d{2}/\d{2}/\d{4})\s+\d{2}/\d{2}/\d{4}\s+([\d,]+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)',
+        text,
+    )
+    if not m:
+        return None
+
+    trade_date = datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+    quantity = float(m.group(2).replace(",", ""))
+    price = float(m.group(3).replace(",", ""))
+
+    tx_m = re.search(r'Transaction Type:\s*(Sold|Bought)', text)
+    if not tx_m:
+        return None
+    is_sell = tx_m.group(1) == "Sold"
+
+    sym_m = re.search(r'Symbol\s*/\s*CUSIP\s*/\s*ISIN:\s*([A-Z.]+)\s*/', text)
+    if not sym_m:
+        return None
+    symbol = TICKER_MAP.get(sym_m.group(1), sym_m.group(1))
+
+    commission = 0.0
+    comm_m = re.search(r'\bCommission\s+\$([\d,]+(?:\.\d+)?)', text)
+    if comm_m:
+        commission += float(comm_m.group(1).replace(",", ""))
+    supp_m = re.search(r'Transaction Fee\s+\$([\d,]+(?:\.\d+)?)', text)
+    if supp_m:
+        commission += float(supp_m.group(1).replace(",", ""))
+
+    return {
+        "symbol": symbol,
+        "datetime": trade_date,
+        "quantity": -quantity if is_sell else quantity,
+        "price": price,
+        "commission": -commission if commission > 0 else 0.0,
+        "filename": pdf_path.name,
+    }
+
+
+def parse_etrade_confirmations(folder: str) -> list[dict]:
+    """Parse all eTrade PDF trade confirmations in a folder."""
+    trades = []
+    for pdf_path in sorted(Path(folder).glob("*.pdf")):
+        trade = _parse_etrade_pdf(pdf_path)
+        if trade:
+            trades.append(trade)
+        else:
+            print(f"  Warning: could not parse {pdf_path.name}", file=sys.stderr)
+    return trades
+
+
 # ── Holdings I/O ──────────────────────────────────────────────────────────────
 
 def parse_holdings(path: str) -> tuple[list[str], list[list[str]]]:
@@ -173,6 +240,11 @@ def write_holdings(path: str, header: list[str], data_rows: list[list[str]]) -> 
 
 def existing_keys(data_rows: list[list[str]]) -> set[tuple[str, str]]:
     return {(r[0].strip(), r[1].strip()) for r in data_rows if len(r) >= 2}
+
+
+def existing_etrade_keys(data_rows: list[list[str]]) -> set[tuple[str, str, str]]:
+    """(symbol, date, price_str) keys — price disambiguates same-day same-symbol trades."""
+    return {(r[0].strip(), r[1].strip(), r[3].strip()) for r in data_rows if len(r) >= 4}
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -417,6 +489,11 @@ def main() -> None:
         help="Skip the stale-entry cleanup step.",
     )
     parser.add_argument(
+        "--etrade",
+        metavar="FOLDER",
+        help="Folder containing eTrade PDF trade confirmations to ingest.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview all changes without writing to disk.",
@@ -433,6 +510,10 @@ def main() -> None:
     ibkr_trades = parse_ibkr_trades(args.ibkr)
     ca_adjustments = group_corporate_actions(parse_ibkr_corporate_actions(args.ibkr))
 
+    etrade_trades: list[dict] = []
+    if args.etrade:
+        etrade_trades = parse_etrade_confirmations(args.etrade)
+
     # Work on a copy throughout so --dry-run never touches the file
     working = [list(r) for r in data_rows]
 
@@ -445,6 +526,18 @@ def main() -> None:
     skipped    = [t for t in ibkr_trades if (t["symbol"], t["datetime"]) in known]
 
     working += [trade_to_row(t) for t in new_trades]
+
+    # eTrade: use (symbol, date, price) key to distinguish same-day trades
+    known_etrade = existing_etrade_keys(data_rows)
+    new_etrade = [
+        t for t in etrade_trades
+        if (t["symbol"], t["datetime"], format_price(t["price"])) not in known_etrade
+    ]
+    skipped_etrade = [
+        t for t in etrade_trades
+        if (t["symbol"], t["datetime"], format_price(t["price"])) in known_etrade
+    ]
+    working += [trade_to_row(t) for t in new_etrade]
 
     # ── Step 3: stale-entry cleanup ───────────────────────────────────────────
     remove_indices: set[int] = set()
@@ -520,6 +613,21 @@ def main() -> None:
             print(f"  {d:4s}  {t['symbol']:8s}  {t['datetime']}  qty={qty:+}  @ ${t['price']:.4f}  comm={format_commission(t['commission'])}")
     print()
 
+    if args.etrade:
+        print(f"eTrade trades: {len(etrade_trades)} total  |  {len(new_etrade)} new  |  {len(skipped_etrade)} already present")
+        if skipped_etrade:
+            print("\n── eTrade: Already in holdings (skipped) ──────────────────────────────")
+            for t in skipped_etrade:
+                d = "BUY" if t["quantity"] > 0 else "SELL"
+                print(f"  {d:4s}  {t['symbol']:8s}  {t['datetime']}  qty={int(t['quantity']):+d}  @ ${t['price']:.4f}  [{t['filename']}]")
+        if new_etrade:
+            print("\n── eTrade: New trades to add ───────────────────────────────────────────")
+            for t in new_etrade:
+                d = "BUY" if t["quantity"] > 0 else "SELL"
+                qty = int(t["quantity"]) if t["quantity"] == int(t["quantity"]) else t["quantity"]
+                print(f"  {d:4s}  {t['symbol']:8s}  {t['datetime']}  qty={qty:+}  @ ${t['price']:.4f}  comm={format_commission(t['commission'])}  [{t['filename']}]")
+        print()
+
     if not args.no_cleanup:
         print(f"── Stale entry cleanup  (cutoff: {cutoff}) ─────────────────────────────")
         if cleanup_report:
@@ -552,6 +660,7 @@ def main() -> None:
     nothing_to_do = (
         not ca_applied
         and not new_trades
+        and not new_etrade
         and not remove_indices
         and not adjust_qtys
         and not order_changed
@@ -578,7 +687,9 @@ def main() -> None:
         ca_lot_count = sum(len(r["changes"]) for r in ca_applied)
         print(f"  {ca_lot_count} lot(s) adjusted for corporate actions")
     if new_trades:
-        print(f"  {len(new_trades)} new trade row(s) added")
+        print(f"  {len(new_trades)} new IBKR trade row(s) added")
+    if new_etrade:
+        print(f"  {len(new_etrade)} new eTrade row(s) added")
     if remove_indices or adjust_qtys:
         print(f"  {len(remove_indices)} stale row(s) removed, {len(adjust_qtys)} buy lot(s) adjusted")
 
