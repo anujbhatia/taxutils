@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Populate USD/INR RBI reference rates in the holdings CSV for sale rows only.
+Populate USD/INR RBI reference rates in the holdings CSV for ALL rows
+(both buy/acquisition rows and sell/transfer rows).
 
-Only rows with a negative Sellable Qty. (i.e. sell transactions) get a rate.
 Per Indian income tax rules the rate used is the RBI reference rate on the
-last day of the month immediately preceding the month of transfer.
+last day of the month immediately preceding the month of the transaction.
+
+  e.g. acquisition on 2014-01-24  →  rate date = 2013-12-31
+       transfer on    2025-05-02  →  rate date = 2025-04-30
 
 Fetches from https://rbi.org.in/scripts/ReferenceRateArchive.aspx.
 Weekends and public holidays fall back to the nearest prior trading day
@@ -64,13 +67,19 @@ def parse_date(s: str) -> date:
 
     Handles:
       2024-07-25, 11:31:31   (IBKR datetime with time)
-      24-MAR-2023            (manual entry, upper-case month abbrev)
-      18-Mar-2025            (manual entry, mixed-case month abbrev)
+      24-Mar-23              (manual entry, 2-digit year)
+      24-MAR-2023            (manual entry, 4-digit year, upper-case)
+      18-Mar-2025            (manual entry, 4-digit year, mixed-case)
     """
     s = s.strip()
     if re.match(r"^\d{4}-\d{2}-\d{2}", s):
         return datetime.strptime(s[:10], "%Y-%m-%d").date()
-    return datetime.strptime(s, "%d-%b-%Y").date()
+    for fmt in ("%d-%b-%Y", "%d-%b-%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot parse date: '{s}'")
 
 
 # ── On-disk rate cache ────────────────────────────────────────────────────────
@@ -281,45 +290,37 @@ def main() -> None:
         while len(row) < len(header):
             row.append("")
 
-    # ── Identify sell rows and their rate-lookup dates ────────────────────────
-    # Per Indian income tax rules: rate = last day of the month preceding transfer.
-    sell_rows: list[tuple[int, date, date]] = []  # (row_idx, sale_date, rate_date)
+    # ── Identify all rows and their rate-lookup dates ─────────────────────────
+    # Rate date = last calendar day of the month immediately preceding the
+    # transaction date (applies to both acquisitions and transfers).
+    all_rows: list[tuple[int, str, date, date]] = []  # (row_idx, kind, txn_date, rate_date)
 
     for i, row in enumerate(data_rows):
         try:
             qty = float(row[qty_idx])
         except (ValueError, IndexError):
             continue
-        if qty >= 0:
-            continue  # buy row — clear any stale rate and skip
         try:
-            sale_date = parse_date(row[date_idx])
+            txn_date = parse_date(row[date_idx])
         except ValueError:
             continue
-        rate_date = last_day_of_preceding_month(sale_date)
-        sell_rows.append((i, sale_date, rate_date))
-
-    sell_indices = {i for i, _, _ in sell_rows}
-
-    # Clear any stale rate values on buy rows
-    for i, row in enumerate(data_rows):
-        if i not in sell_indices and row[rate_idx].strip():
-            row[rate_idx] = ""
+        kind = "sell" if qty < 0 else "buy"
+        rate_date = last_day_of_preceding_month(txn_date)
+        all_rows.append((i, kind, txn_date, rate_date))
 
     # Skip rows that already have a rate (unless --force)
     needed_rate_dates = [
         rate_date
-        for i, _sale, rate_date in sell_rows
+        for i, _kind, _txn, rate_date in all_rows
         if args.force or not data_rows[i][rate_idx].strip()
     ]
 
-    sell_count   = len(sell_rows)
-    already_done = sum(
-        1 for i, _, _ in sell_rows if data_rows[i][rate_idx].strip()
-    )
+    buy_count  = sum(1 for _, k, _, _ in all_rows if k == "buy")
+    sell_count = sum(1 for _, k, _, _ in all_rows if k == "sell")
+    already_done = sum(1 for i, _, _, _ in all_rows if data_rows[i][rate_idx].strip())
 
     print(f"Holdings file  : {args.holdings}")
-    print(f"Total rows     : {len(data_rows)}  ({sell_count} sell row(s))")
+    print(f"Total rows     : {len(data_rows)}  ({buy_count} buy,  {sell_count} sell)")
     print(f"Rates needed   : {len(set(needed_rate_dates))} unique date(s) across "
           f"{len(needed_rate_dates)} row(s)  ({already_done} already set)")
     print()
@@ -332,26 +333,25 @@ def main() -> None:
     if not args.dry_run:
         save_cache(cache)
 
-    # ── Apply rates to sell rows ──────────────────────────────────────────────
+    # ── Apply rates to all rows ───────────────────────────────────────────────
     updated = missing = 0
 
-    for i, sale_date, rate_date in sell_rows:
+    for i, kind, txn_date, rate_date in all_rows:
         row = data_rows[i]
-        already_set = row[rate_idx].strip()
-        if already_set and not args.force:
+        if row[rate_idx].strip() and not args.force:
             continue
 
         rate, actual_date = resolve_rate(rate_date, cache)
 
         if rate is None:
-            print(f"  WARNING  {row[0]:8s}  sale {sale_date}  "
+            print(f"  WARNING  {row[0]:8s}  {kind} {txn_date}  "
                   f"rate-date {rate_date}  — no rate found within 7-day lookback")
             missing += 1
             continue
 
         note = (f"  [used {actual_date}, {(rate_date - actual_date).days}d back]"
                 if actual_date != rate_date else "")
-        print(f"  {row[0]:8s}  sold {sale_date}  "
+        print(f"  {row[0]:8s}  {kind:4s} {txn_date}  "
               f"rate-date {rate_date}  →  ₹{rate:.4f}{note}")
         row[rate_idx] = f"{rate:.4f}"
         updated += 1
